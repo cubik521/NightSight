@@ -12,6 +12,7 @@ targets:
       - path: .
         includes:
           - "*.swift"
+      - path: Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: app.yellow2173.nadir6666
@@ -20,6 +21,7 @@ targets:
         CURRENT_PROJECT_VERSION: "1"
         SWIFT_VERSION: "5.0"
         TARGETED_DEVICE_FAMILY: "1"
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
         GENERATE_INFOPLIST_FILE: YES
         INFOPLIST_KEY_NSCameraUsageDescription: "Доступ к камере и LiDAR-сканеру"
         INFOPLIST_KEY_UILaunchScreen_Generation: YES
