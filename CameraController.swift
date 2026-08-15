@@ -7,9 +7,16 @@ import Combine
 /// Сканер светит собственным ИК-лучом, поэтому внешний свет не нужен.
 final class CameraController: NSObject, ObservableObject {
 
+    // MARK: - Выход
+
     @Published var image: UIImage?
     @Published var centerMeters: Float?
+    @Published var nearestMeters: Float?
+    /// Сработало ли предупреждение о препятствии (с гистерезисом).
+    @Published var alerting: Bool = false
     @Published var status: String = ""
+
+    // MARK: - Настройки
 
     @Published var style: RenderStyle = .points {
         didSet { let s = style; queue.async { self.renderer.style = s } }
@@ -17,10 +24,19 @@ final class CameraController: NSObject, ObservableObject {
     @Published var depthFiltering: Bool = true {
         didSet { let f = depthFiltering; queue.async { self.depthOutput.isFilteringEnabled = f } }
     }
-    /// Сила светотени в объёмном режиме.
     @Published var relief: Float = 0.75 {
         didSet { let r = relief; queue.async { self.renderer.relief = r } }
     }
+
+    @Published var alertEnabled: Bool = true
+    /// Порог срабатывания в метрах.
+    @Published var alertThreshold: Float = 0.5
+    @Published var alertZone: AlertZone = .center {
+        didSet { let z = alertZone; queue.async { self.renderer.alertZone = z } }
+    }
+    @Published var hapticsEnabled: Bool = true
+
+    // MARK: - Внутреннее
 
     let session = AVCaptureSession()
     private let depthOutput = AVCaptureDepthDataOutput()
@@ -28,6 +44,9 @@ final class CameraController: NSObject, ObservableObject {
     private let queue = DispatchQueue(label: "nightsight.capture", qos: .userInitiated)
     private let renderer = DepthRenderer()
     private var device: AVCaptureDevice?
+
+    private let haptic = UIImpactFeedbackGenerator(style: .medium)
+    private var lastHaptic = Date.distantPast
 
     func start() {
         AVCaptureDevice.requestAccess(for: .video) { [weak self] granted in
@@ -41,6 +60,7 @@ final class CameraController: NSObject, ObservableObject {
                 if !self.session.isRunning { self.session.startRunning() }
             }
         }
+        haptic.prepare()
     }
 
     func stop() {
@@ -90,15 +110,13 @@ final class CameraController: NSObject, ObservableObject {
 
         renderer.style = style
         renderer.relief = relief
+        renderer.alertZone = alertZone
         selectBestFormat(device)
-
-        // Угол обзора объектива нужен для обратной проекции пикселей в пространство
         renderer.fieldOfView = device.activeFormat.videoFieldOfView
 
         DispatchQueue.main.async { self.status = "" }
     }
 
-    /// Берём формат с самой подробной картой глубины.
     private func selectBestFormat(_ device: AVCaptureDevice) {
         func dims(_ f: AVCaptureDevice.Format) -> CMVideoDimensions {
             CMVideoFormatDescriptionGetDimensions(f.formatDescription)
@@ -137,6 +155,33 @@ final class CameraController: NSObject, ObservableObject {
             DispatchQueue.main.async { self.status = "Ошибка формата: \(error.localizedDescription)" }
         }
     }
+
+    // MARK: - Логика предупреждения
+
+    /// Гистерезис: включаемся на пороге, отпускаем на 10 см дальше,
+    /// иначе на границе рамка дёргается по нескольку раз в секунду.
+    private func updateAlert(_ nearest: Float?) {
+        guard alertEnabled, let d = nearest else {
+            if alerting { alerting = false }
+            return
+        }
+        if alerting {
+            if d > alertThreshold + 0.10 { alerting = false }
+        } else {
+            if d <= alertThreshold { alerting = true }
+        }
+
+        guard alerting, hapticsEnabled else { return }
+
+        // Чем ближе объект, тем чаще стук: от 0.6 с у порога до 0.09 с вплотную
+        let ratio = min(max(d / max(alertThreshold, 0.01), 0), 1)
+        let interval = 0.09 + Double(ratio) * 0.51
+        if Date().timeIntervalSince(lastHaptic) >= interval {
+            haptic.impactOccurred(intensity: CGFloat(1.0 - ratio * 0.5))
+            haptic.prepare()
+            lastHaptic = Date()
+        }
+    }
 }
 
 extension CameraController: AVCaptureDepthDataOutputDelegate {
@@ -149,6 +194,8 @@ extension CameraController: AVCaptureDepthDataOutputDelegate {
         DispatchQueue.main.async {
             self.image = frame.image
             self.centerMeters = frame.centerMeters
+            self.nearestMeters = frame.nearestMeters
+            self.updateAlert(frame.nearestMeters)
         }
     }
 }
