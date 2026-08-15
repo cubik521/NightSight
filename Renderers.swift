@@ -4,8 +4,10 @@ import UIKit
 
 struct DepthFrame {
     let image: UIImage?
-    /// Расстояние до центральной точки в метрах, nil — нет валидных измерений.
+    /// Расстояние до центральной точки в метрах (дальномер).
     let centerMeters: Float?
+    /// Ближайшее расстояние в зоне слежения (предупреждение о препятствии).
+    let nearestMeters: Float?
 }
 
 enum RenderStyle: String, CaseIterable, Identifiable {
@@ -14,21 +16,34 @@ enum RenderStyle: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+/// Область кадра, по которой ищется ближайшее препятствие.
+enum AlertZone: String, CaseIterable, Identifiable {
+    case center = "Центр"
+    case lower  = "Снизу"
+    case full   = "Весь кадр"
+    var id: String { rawValue }
+
+    var hint: String {
+        switch self {
+        case .center: return "Только середина экрана — куда наведён прицел"
+        case .lower:  return "Нижняя половина — пол и препятствия под ногами"
+        case .full:   return "Всё поле зрения сканера"
+        }
+    }
+}
+
 /// Отрисовка карты глубины.
 ///
-/// Режим `.points` — объёмное облако: каждый отсчёт разворачивается в трёхмерную
-/// координату, по соседям считается нормаль поверхности и освещается виртуальным
-/// источником света. Камера смотрит строго вперёд, как настоящая, поэтому объём
-/// даёт не параллакс, а светотень плюс уменьшение точек с расстоянием.
-///
-/// Режим `.smooth` — плоская карта, только цвет по дальности.
+/// Режим `.points` — объёмное облако: отсчёты разворачиваются в трёхмерные координаты,
+/// по соседям считается нормаль поверхности и освещается виртуальным источником.
+/// Камера смотрит строго вперёд, поэтому объём даёт светотень, а не параллакс.
 final class DepthRenderer {
 
     var style: RenderStyle = .points
+    var alertZone: AlertZone = .center
 
-    /// Горизонтальный угол обзора объектива в градусах — нужен для обратной проекции.
+    /// Горизонтальный угол обзора объектива в градусах — для обратной проекции.
     var fieldOfView: Float = 70
-
     /// Сила светотени: 0 — плоско, 1 — контрастный рельеф.
     var relief: Float = 0.75
 
@@ -42,7 +57,7 @@ final class DepthRenderer {
     private let histMax: Float = 8.0
     private var histogram = [Int](repeating: 0, count: 160)
 
-    // Источник света: сверху-слева-спереди, как привычно глазу
+    // Источник света: сверху-слева-спереди
     private let lightX: Float = -0.45
     private let lightY: Float = -0.55
     private let lightZ: Float = -0.70
@@ -51,6 +66,7 @@ final class DepthRenderer {
     private var zbuf: [Float] = []
     private var canvasW = 0
     private var canvasH = 0
+    private var zoneValues: [Float] = []
 
     func render(_ depthData: AVDepthData) -> DepthFrame {
 
@@ -67,7 +83,7 @@ final class DepthRenderer {
         let h = CVPixelBufferGetHeight(buffer)
         let rowBytes = CVPixelBufferGetBytesPerRow(buffer)
         guard let base = CVPixelBufferGetBaseAddress(buffer) else {
-            return DepthFrame(image: nil, centerMeters: nil)
+            return DepthFrame(image: nil, centerMeters: nil, nearestMeters: nil)
         }
 
         func depth(_ x: Int, _ y: Int) -> Float {
@@ -78,6 +94,7 @@ final class DepthRenderer {
         updateRange(w: w, h: h, sample: depth)
         let centerMeters = medianDepth(cx: w / 2, cy: h / 2, radius: 4,
                                        w: w, h: h, sample: depth)
+        let nearestMeters = nearestInZone(w: w, h: h, sample: depth)
 
         let cg: CGImage?
         switch style {
@@ -85,25 +102,57 @@ final class DepthRenderer {
         case .smooth: cg = drawSmooth(w: w, h: h, sample: depth)
         }
 
-        guard let cg else { return DepthFrame(image: nil, centerMeters: centerMeters) }
+        guard let cg else {
+            return DepthFrame(image: nil, centerMeters: centerMeters, nearestMeters: nearestMeters)
+        }
 
-        // Облако рисуется сразу в портретный холст, плоская карта — в системе сенсора.
         let orientation: UIImage.Orientation = (style == .points) ? .up : .right
         return DepthFrame(image: UIImage(cgImage: cg, scale: 1, orientation: orientation),
-                          centerMeters: centerMeters)
+                          centerMeters: centerMeters,
+                          nearestMeters: nearestMeters)
+    }
+
+    // MARK: - Поиск ближайшего препятствия
+
+    /// Второй процентиль вместо абсолютного минимума — иначе один шумный
+    /// отсчёт заставит рамку моргать без повода.
+    private func nearestInZone(w: Int, h: Int, sample: (Int, Int) -> Float) -> Float? {
+        // Вертикаль экрана идёт вдоль оси X сенсора: sx = 0 сверху, sx = w снизу.
+        let xRange: ClosedRange<Int>
+        let yRange: ClosedRange<Int>
+        switch alertZone {
+        case .center:
+            xRange = Int(Float(w) * 0.32)...Int(Float(w) * 0.68)
+            yRange = Int(Float(h) * 0.32)...Int(Float(h) * 0.68)
+        case .lower:
+            xRange = Int(Float(w) * 0.50)...(w - 1)
+            yRange = 0...(h - 1)
+        case .full:
+            xRange = 0...(w - 1)
+            yRange = 0...(h - 1)
+        }
+
+        zoneValues.removeAll(keepingCapacity: true)
+        for x in stride(from: xRange.lowerBound, through: xRange.upperBound, by: 3) {
+            for y in stride(from: yRange.lowerBound, through: yRange.upperBound, by: 3) {
+                let d = sample(x, y)
+                if d.isFinite, d > 0.05, d < histMax { zoneValues.append(d) }
+            }
+        }
+        guard zoneValues.count >= 25 else { return nil }
+        zoneValues.sort()
+        return zoneValues[max(1, zoneValues.count / 50)]
     }
 
     // MARK: - Объёмное облако точек
 
     private func drawPoints(w: Int, h: Int, sample: (Int, Int) -> Float) -> CGImage? {
 
-        // Портретный холст: вертикаль экрана идёт вдоль оси X сенсора
         let scale: Float = 3.2
         let outH = Int(Float(w) * scale)
         let outW = Int(Float(h) * scale)
         ensureCanvas(outW, outH)
 
-        // Фокусное расстояние в пикселях карты глубины из угла обзора объектива
         let hfov = fieldOfView * .pi / 180
         let fx = Float(w) * 0.5 / tan(hfov * 0.5)
         let cx = Float(w) * 0.5
@@ -122,7 +171,6 @@ final class DepthRenderer {
             zbuf[i] = .greatestFiniteMagnitude
         }
 
-        /// Разворачивает пиксель карты в точку пространства (система сенсора).
         func unproject(_ x: Int, _ y: Int, _ d: Float) -> (Float, Float, Float) {
             ((Float(x) - cx) * d / fx, (Float(y) - cy) * d / fx, d)
         }
@@ -136,7 +184,6 @@ final class DepthRenderer {
                     let d = sample(sx, sy)
                     guard d.isFinite, d > 0.05, d < histMax else { continue }
 
-                    // --- нормаль поверхности по четырём соседям ---
                     let dR = sample(sx + step, sy), dL = sample(sx - step, sy)
                     let dD = sample(sx, sy + step), dU = sample(sx, sy - step)
 
@@ -150,11 +197,9 @@ final class DepthRenderer {
                         let pD = unproject(sx, sy + step, dD)
                         let pU = unproject(sx, sy - step, dU)
 
-                        // касательные векторы вдоль поверхности
                         let ax = pR.0 - pL.0, ay = pR.1 - pL.1, az = pR.2 - pL.2
                         let bx = pD.0 - pU.0, by = pD.1 - pU.1, bz = pD.2 - pU.2
 
-                        // векторное произведение = нормаль
                         var nx = ay * bz - az * by
                         var ny = az * bx - ax * bz
                         var nz = ax * by - ay * bx
@@ -166,19 +211,17 @@ final class DepthRenderer {
                         }
                     }
 
-                    // --- положение на холсте: поворот сенсора в портрет ---
                     let ix = Int(Float(h - 1 - sy) * scale)
                     let iy = Int(Float(sx) * scale)
                     guard ix >= 0, ix < outW, iy >= 0, iy < outH else { continue }
 
-                    // Размер падает с расстоянием — ближнее плотное, дальнее разреженное
                     let radius = max(1, min(6, Int(fView * 0.011 / d)))
 
                     let t = min(max((d - near) / span, 0), 1)
-                    let base = palette(1 - t)
-                    let c = (UInt8(min(255, Float(base.0) * shade)),
-                             UInt8(min(255, Float(base.1) * shade)),
-                             UInt8(min(255, Float(base.2) * shade)))
+                    let baseColor = palette(1 - t)
+                    let c = (UInt8(min(255, Float(baseColor.0) * shade)),
+                             UInt8(min(255, Float(baseColor.1) * shade)),
+                             UInt8(min(255, Float(baseColor.2) * shade)))
 
                     splat(out, zb, outW, outH, ix, iy, radius, d, c)
                 }
@@ -189,7 +232,6 @@ final class DepthRenderer {
         return makeImage(canvas, outW, outH, interpolate: false)
     }
 
-    /// Рисует точку с проверкой Z-буфера, чтобы ближнее перекрывало дальнее.
     private func splat(_ out: UnsafeMutableBufferPointer<UInt8>,
                        _ zb: UnsafeMutableBufferPointer<Float>,
                        _ outW: Int, _ outH: Int,
