@@ -57,23 +57,80 @@ struct ContentView: View {
         }
     }
 
+    // MARK: - Панель управления
+
+    private var panel: some View {
+        HStack(alignment: .top, spacing: 12) {
+
+            VStack(spacing: 10) {
+                Picker("Стиль", selection: $camera.style) {
+                    ForEach(RenderStyle.allCases) { Text($0.rawValue).tag($0) }
+                }
+                .pickerStyle(.segmented)
+
+                if camera.style == .points {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Рельеф").font(.caption)
+                            Spacer()
+                            Text(String(format: "%.0f%%", camera.relief * 100))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.orange)
+                        }
+                        Slider(value: $camera.relief, in: 0...1).tint(.orange)
+                    }
+                }
+
+                Toggle("Сглаживание дыр", isOn: $camera.depthFiltering)
+                    .font(.caption)
+                    .tint(.orange)
+            }
+            .foregroundStyle(.white)
+
+            VStack(spacing: 10) {
+                circleButton(icon: rangefinder ? "scope" : "ruler", active: rangefinder) {
+                    withAnimation(.easeInOut(duration: 0.15)) { rangefinder.toggle() }
+                }
+                circleButton(icon: "slider.horizontal.3", active: false) {
+                    showSettings = true
+                }
+            }
+        }
+        .padding(14)
+        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
+        .padding(.horizontal, 12)
+        .padding(.bottom, 20)
+    }
+
+    private func circleButton(icon: String, active: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: icon)
+                .font(.system(size: 18, weight: .medium))
+                .foregroundStyle(active ? .black : .white)
+                .frame(width: 46, height: 46)
+                .background(
+                    Circle().fill(active ? AnyShapeStyle(.white)
+                                         : AnyShapeStyle(.white.opacity(0.15)))
+                )
+                .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
+        }
+    }
+
     // MARK: - Предупреждение
 
     private var alertBorder: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 44)
-                .strokeBorder(Color.red, lineWidth: 7)
-                .shadow(color: .red.opacity(0.85), radius: 22)
-                .opacity(pulse ? 0.45 : 1.0)
-        }
-        .ignoresSafeArea()
-        .allowsHitTesting(false)
-        .onAppear {
-            withAnimation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true)) {
-                pulse = true
+        RoundedRectangle(cornerRadius: 44)
+            .strokeBorder(Color.red, lineWidth: 7)
+            .shadow(color: .red.opacity(0.85), radius: 22)
+            .opacity(pulse ? 0.45 : 1.0)
+            .ignoresSafeArea()
+            .allowsHitTesting(false)
+            .onAppear {
+                withAnimation(.easeInOut(duration: 0.4).repeatForever(autoreverses: true)) {
+                    pulse = true
+                }
             }
-        }
-        .onDisappear { pulse = false }
+            .onDisappear { pulse = false }
     }
 
     private var proximityBadge: some View {
@@ -87,42 +144,6 @@ struct ContentView: View {
         .padding(.vertical, 8)
         .background(.red.opacity(0.85), in: Capsule())
         .allowsHitTesting(false)
-    }
-
-    // MARK: - Панель
-
-    private var panel: some View {
-        HStack(spacing: 12) {
-            Picker("Стиль", selection: $camera.style) {
-                ForEach(RenderStyle.allCases) { Text($0.rawValue).tag($0) }
-            }
-            .pickerStyle(.segmented)
-
-            circleButton(icon: rangefinder ? "scope" : "ruler", active: rangefinder) {
-                withAnimation(.easeInOut(duration: 0.15)) { rangefinder.toggle() }
-            }
-            circleButton(icon: "slider.horizontal.3", active: false) {
-                showSettings = true
-            }
-        }
-        .padding(14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 20))
-        .padding(.horizontal, 12)
-        .padding(.bottom, 20)
-    }
-
-    private func circleButton(icon: String, active: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: icon)
-                .font(.system(size: 19, weight: .medium))
-                .foregroundStyle(active ? .black : .white)
-                .frame(width: 50, height: 50)
-                .background(
-                    Circle().fill(active ? AnyShapeStyle(.white)
-                                         : AnyShapeStyle(.white.opacity(0.15)))
-                )
-                .overlay(Circle().stroke(.white.opacity(0.25), lineWidth: 1))
-        }
     }
 
     // MARK: - Прицел
@@ -206,23 +227,12 @@ struct SettingsView: View {
                         .disabled(!camera.alertEnabled)
                 }
 
-                Section("Изображение") {
-                    VStack(alignment: .leading, spacing: 4) {
-                        HStack {
-                            Text("Рельеф")
-                            Spacer()
-                            Text(String(format: "%.0f%%", camera.relief * 100))
-                                .font(.body.monospaced())
-                                .foregroundStyle(.orange)
-                        }
-                        Slider(value: $camera.relief, in: 0...1).tint(.orange)
-                    }
-                    .disabled(camera.style != .points)
-
-                    Toggle("Сглаживание дыр", isOn: $camera.depthFiltering)
-                    Text("Уплотняет карту глубины, используя кадр с камеры. В темноте лучше выключать.")
+                Section {
+                    Text("Сглаживание уплотняет карту глубины, используя кадр с камеры. В темноте лучше выключать — там RGB превращается в шум.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                } header: {
+                    Text("Справка")
                 }
             }
             .navigationTitle("Настройки")
