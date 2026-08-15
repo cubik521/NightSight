@@ -4,8 +4,7 @@ import UIKit
 import Combine
 
 /// Поток глубины с LiDAR напрямую через AVFoundation, минуя ARKit.
-/// Сканер светит собственным ИК-лучом, поэтому внешний свет не нужен —
-/// но апертура сканера должна быть открыта, пальцем её перекрывать нельзя.
+/// Сканер светит собственным ИК-лучом, поэтому внешний свет не нужен.
 final class CameraController: NSObject, ObservableObject {
 
     @Published var image: UIImage?
@@ -17,6 +16,10 @@ final class CameraController: NSObject, ObservableObject {
     }
     @Published var depthFiltering: Bool = true {
         didSet { let f = depthFiltering; queue.async { self.depthOutput.isFilteringEnabled = f } }
+    }
+    /// Сила светотени в объёмном режиме.
+    @Published var relief: Float = 0.75 {
+        didSet { let r = relief; queue.async { self.renderer.relief = r } }
     }
 
     let session = AVCaptureSession()
@@ -71,8 +74,8 @@ final class CameraController: NSObject, ObservableObject {
             return
         }
 
-        // Видеовыход не используем, но держим — часть конфигураций
-        // не отдаёт глубину без активного видеотракта.
+        // Видеокадры не читаем, но выход держим: без активного видеотракта
+        // устройство не отдаёт глубину.
         videoOutput.videoSettings = [
             kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA
         ]
@@ -86,7 +89,11 @@ final class CameraController: NSObject, ObservableObject {
         depthOutput.setDelegate(self, callbackQueue: queue)
 
         renderer.style = style
+        renderer.relief = relief
         selectBestFormat(device)
+
+        // Угол обзора объектива нужен для обратной проекции пикселей в пространство
+        renderer.fieldOfView = device.activeFormat.videoFieldOfView
 
         DispatchQueue.main.async { self.status = "" }
     }
