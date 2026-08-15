@@ -1,8 +1,13 @@
 name: Build NightSight
 
+# Только ручной запуск: коммиты сборку не поднимают.
+# Правишь сколько угодно файлов, потом Actions -> Run workflow.
 on:
-  push:
   workflow_dispatch:
+
+concurrency:
+  group: nightsight-build
+  cancel-in-progress: true
 
 jobs:
   build:
