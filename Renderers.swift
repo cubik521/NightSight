@@ -14,15 +14,24 @@ enum RenderStyle: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-/// Отрисовка карты глубины. Диапазон подбирается автоматически по перцентилям сцены
-/// и сглаживается между кадрами, чтобы картинка не «дышала» при малейшем движении.
+/// Отрисовка карты глубины.
+///
+/// Режим `.points` — объёмное облако: каждый отсчёт разворачивается в трёхмерную
+/// координату, по соседям считается нормаль поверхности и освещается виртуальным
+/// источником света. Камера смотрит строго вперёд, как настоящая, поэтому объём
+/// даёт не параллакс, а светотень плюс уменьшение точек с расстоянием.
+///
+/// Режим `.smooth` — плоская карта, только цвет по дальности.
 final class DepthRenderer {
 
     var style: RenderStyle = .points
 
-    /// Во сколько раз выходная картинка крупнее карты глубины (режим точек).
-    private let upscale = 5
-    /// Берём каждый N-й отсчёт — иначе точки сливаются в сплошную заливку.
+    /// Горизонтальный угол обзора объектива в градусах — нужен для обратной проекции.
+    var fieldOfView: Float = 70
+
+    /// Сила светотени: 0 — плоско, 1 — контрастный рельеф.
+    var relief: Float = 0.75
+
     private let step = 2
 
     private var smoothedNear: Float = 0.3
@@ -32,6 +41,16 @@ final class DepthRenderer {
     private let binCount = 160
     private let histMax: Float = 8.0
     private var histogram = [Int](repeating: 0, count: 160)
+
+    // Источник света: сверху-слева-спереди, как привычно глазу
+    private let lightX: Float = -0.45
+    private let lightY: Float = -0.55
+    private let lightZ: Float = -0.70
+
+    private var canvas: [UInt8] = []
+    private var zbuf: [Float] = []
+    private var canvasW = 0
+    private var canvasH = 0
 
     func render(_ depthData: AVDepthData) -> DepthFrame {
 
@@ -57,22 +76,171 @@ final class DepthRenderer {
         }
 
         updateRange(w: w, h: h, sample: depth)
-
-        let near = smoothedNear
-        let span = max(smoothedFar - smoothedNear, 0.001)
-
         let centerMeters = medianDepth(cx: w / 2, cy: h / 2, radius: 4,
                                        w: w, h: h, sample: depth)
 
         let cg: CGImage?
         switch style {
-        case .points: cg = drawPoints(w: w, h: h, near: near, span: span, sample: depth)
-        case .smooth: cg = drawSmooth(w: w, h: h, near: near, span: span, sample: depth)
+        case .points: cg = drawPoints(w: w, h: h, sample: depth)
+        case .smooth: cg = drawSmooth(w: w, h: h, sample: depth)
         }
 
         guard let cg else { return DepthFrame(image: nil, centerMeters: centerMeters) }
-        return DepthFrame(image: UIImage(cgImage: cg, scale: 1, orientation: .right),
+
+        // Облако рисуется сразу в портретный холст, плоская карта — в системе сенсора.
+        let orientation: UIImage.Orientation = (style == .points) ? .up : .right
+        return DepthFrame(image: UIImage(cgImage: cg, scale: 1, orientation: orientation),
                           centerMeters: centerMeters)
+    }
+
+    // MARK: - Объёмное облако точек
+
+    private func drawPoints(w: Int, h: Int, sample: (Int, Int) -> Float) -> CGImage? {
+
+        // Портретный холст: вертикаль экрана идёт вдоль оси X сенсора
+        let scale: Float = 3.2
+        let outH = Int(Float(w) * scale)
+        let outW = Int(Float(h) * scale)
+        ensureCanvas(outW, outH)
+
+        // Фокусное расстояние в пикселях карты глубины из угла обзора объектива
+        let hfov = fieldOfView * .pi / 180
+        let fx = Float(w) * 0.5 / tan(hfov * 0.5)
+        let cx = Float(w) * 0.5
+        let cy = Float(h) * 0.5
+        let fView = fx * scale
+
+        let near = smoothedNear
+        let span = max(smoothedFar - smoothedNear, 0.001)
+
+        let ll = sqrt(lightX*lightX + lightY*lightY + lightZ*lightZ)
+        let lx = lightX / ll, ly = lightY / ll, lz = lightZ / ll
+
+        for i in 0..<(outW * outH) {
+            canvas[i * 4] = 0; canvas[i * 4 + 1] = 0
+            canvas[i * 4 + 2] = 0; canvas[i * 4 + 3] = 255
+            zbuf[i] = .greatestFiniteMagnitude
+        }
+
+        /// Разворачивает пиксель карты в точку пространства (система сенсора).
+        func unproject(_ x: Int, _ y: Int, _ d: Float) -> (Float, Float, Float) {
+            ((Float(x) - cx) * d / fx, (Float(y) - cy) * d / fx, d)
+        }
+
+        canvas.withUnsafeMutableBufferPointer { out in
+        zbuf.withUnsafeMutableBufferPointer { zb in
+
+            for sy in stride(from: step, to: h - step, by: step) {
+                for sx in stride(from: step, to: w - step, by: step) {
+
+                    let d = sample(sx, sy)
+                    guard d.isFinite, d > 0.05, d < histMax else { continue }
+
+                    // --- нормаль поверхности по четырём соседям ---
+                    let dR = sample(sx + step, sy), dL = sample(sx - step, sy)
+                    let dD = sample(sx, sy + step), dU = sample(sx, sy - step)
+
+                    var shade: Float = 1.0
+                    if dR.isFinite, dL.isFinite, dD.isFinite, dU.isFinite,
+                       dR > 0.05, dL > 0.05, dD > 0.05, dU > 0.05,
+                       abs(dR - dL) < 0.5, abs(dD - dU) < 0.5 {
+
+                        let pR = unproject(sx + step, sy, dR)
+                        let pL = unproject(sx - step, sy, dL)
+                        let pD = unproject(sx, sy + step, dD)
+                        let pU = unproject(sx, sy - step, dU)
+
+                        // касательные векторы вдоль поверхности
+                        let ax = pR.0 - pL.0, ay = pR.1 - pL.1, az = pR.2 - pL.2
+                        let bx = pD.0 - pU.0, by = pD.1 - pU.1, bz = pD.2 - pU.2
+
+                        // векторное произведение = нормаль
+                        var nx = ay * bz - az * by
+                        var ny = az * bx - ax * bz
+                        var nz = ax * by - ay * bx
+                        let nl = sqrt(nx*nx + ny*ny + nz*nz)
+                        if nl > 1e-6 {
+                            nx /= nl; ny /= nl; nz /= nl
+                            let diffuse = max(0, -(nx * lx + ny * ly + nz * lz))
+                            shade = (1 - relief) + relief * diffuse
+                        }
+                    }
+
+                    // --- положение на холсте: поворот сенсора в портрет ---
+                    let ix = Int(Float(h - 1 - sy) * scale)
+                    let iy = Int(Float(sx) * scale)
+                    guard ix >= 0, ix < outW, iy >= 0, iy < outH else { continue }
+
+                    // Размер падает с расстоянием — ближнее плотное, дальнее разреженное
+                    let radius = max(1, min(6, Int(fView * 0.011 / d)))
+
+                    let t = min(max((d - near) / span, 0), 1)
+                    let base = palette(1 - t)
+                    let c = (UInt8(min(255, Float(base.0) * shade)),
+                             UInt8(min(255, Float(base.1) * shade)),
+                             UInt8(min(255, Float(base.2) * shade)))
+
+                    splat(out, zb, outW, outH, ix, iy, radius, d, c)
+                }
+            }
+        }
+        }
+
+        return makeImage(canvas, outW, outH, interpolate: false)
+    }
+
+    /// Рисует точку с проверкой Z-буфера, чтобы ближнее перекрывало дальнее.
+    private func splat(_ out: UnsafeMutableBufferPointer<UInt8>,
+                       _ zb: UnsafeMutableBufferPointer<Float>,
+                       _ outW: Int, _ outH: Int,
+                       _ cx: Int, _ cy: Int, _ r: Int, _ z: Float,
+                       _ color: (UInt8, UInt8, UInt8)) {
+        let y0 = max(cy - r, 0), y1 = min(cy + r, outH - 1)
+        let x0 = max(cx - r, 0), x1 = min(cx + r, outW - 1)
+        guard y0 <= y1, x0 <= x1 else { return }
+        let rr = r * r + r
+        for y in y0...y1 {
+            let rowBase = y * outW
+            for x in x0...x1 {
+                let dx = x - cx, dy = y - cy
+                if dx * dx + dy * dy > rr { continue }
+                let idx = rowBase + x
+                if z >= zb[idx] { continue }
+                zb[idx] = z
+                let o = idx * 4
+                out[o] = color.0; out[o + 1] = color.1; out[o + 2] = color.2
+            }
+        }
+    }
+
+    private func ensureCanvas(_ w: Int, _ h: Int) {
+        guard canvasW != w || canvasH != h else { return }
+        canvasW = w; canvasH = h
+        canvas = [UInt8](repeating: 0, count: w * h * 4)
+        zbuf = [Float](repeating: .greatestFiniteMagnitude, count: w * h)
+    }
+
+    // MARK: - Плоская заливка
+
+    private func drawSmooth(w: Int, h: Int, sample: (Int, Int) -> Float) -> CGImage? {
+        var flat = [UInt8](repeating: 0, count: w * h * 4)
+        let near = smoothedNear
+        let span = max(smoothedFar - smoothedNear, 0.001)
+
+        flat.withUnsafeMutableBufferPointer { out in
+            for y in 0..<h {
+                for x in 0..<w {
+                    let o = (y * w + x) * 4
+                    out[o + 3] = 255
+                    let d = sample(x, y)
+                    guard d.isFinite, d > 0.05 else { continue }
+                    let t = min(max((d - near) / span, 0), 1)
+                    let c = palette(1 - t)
+                    out[o] = c.0; out[o + 1] = c.1; out[o + 2] = c.2
+                }
+            }
+        }
+        return makeImage(flat, w, h, interpolate: true)
     }
 
     // MARK: - Автодиапазон
@@ -80,9 +248,8 @@ final class DepthRenderer {
     private func updateRange(w: Int, h: Int, sample: (Int, Int) -> Float) {
         for i in 0..<binCount { histogram[i] = 0 }
         var valid = 0
-        let scanStep = 3
-        for y in stride(from: 0, to: h, by: scanStep) {
-            for x in stride(from: 0, to: w, by: scanStep) {
+        for y in stride(from: 0, to: h, by: 3) {
+            for x in stride(from: 0, to: w, by: 3) {
                 let d = sample(x, y)
                 guard d.isFinite, d > 0.05, d < histMax else { continue }
                 histogram[min(Int(d / histMax * Float(binCount)), binCount - 1)] += 1
@@ -115,61 +282,10 @@ final class DepthRenderer {
         }
     }
 
-    // MARK: - Стиль «точки»
-
-    private func drawPoints(w: Int, h: Int, near: Float, span: Float,
-                            sample: (Int, Int) -> Float) -> CGImage? {
-        let outW = w * upscale / step
-        let outH = h * upscale / step
-        var rgba = [UInt8](repeating: 0, count: outW * outH * 4)
-
-        rgba.withUnsafeMutableBufferPointer { out in
-            for i in 0..<(outW * outH) { out[i * 4 + 3] = 255 }
-
-            var oy = 0
-            for y in stride(from: 0, to: h, by: step) {
-                var ox = 0
-                for x in stride(from: 0, to: w, by: step) {
-                    defer { ox += upscale }
-                    let d = sample(x, y)
-                    guard d.isFinite, d > 0.05 else { continue }
-                    let t = min(max((d - near) / span, 0), 1)
-                    let c = palette(1 - t)
-                    let size = 2 + Int((1 - t) * 2.2)   // ближе — крупнее
-                    dot(out, outW, outH, ox + upscale / 2, oy + upscale / 2, size, c)
-                }
-                oy += upscale
-            }
-        }
-        return makeImage(rgba, outW, outH, interpolate: false)
-    }
-
-    // MARK: - Стиль «заливка»
-
-    private func drawSmooth(w: Int, h: Int, near: Float, span: Float,
-                            sample: (Int, Int) -> Float) -> CGImage? {
-        var rgba = [UInt8](repeating: 0, count: w * h * 4)
-
-        rgba.withUnsafeMutableBufferPointer { out in
-            for y in 0..<h {
-                for x in 0..<w {
-                    let o = (y * w + x) * 4
-                    out[o + 3] = 255
-                    let d = sample(x, y)
-                    guard d.isFinite, d > 0.05 else { continue }
-                    let t = min(max((d - near) / span, 0), 1)
-                    let c = palette(1 - t)
-                    out[o] = c.0; out[o + 1] = c.1; out[o + 2] = c.2
-                }
-            }
-        }
-        return makeImage(rgba, w, h, interpolate: true)
-    }
-
     // MARK: - Вспомогательное
 
-    private func makeImage(_ rgba: [UInt8], _ w: Int, _ h: Int, interpolate: Bool) -> CGImage? {
-        guard let provider = CGDataProvider(data: Data(rgba) as CFData) else { return nil }
+    private func makeImage(_ pixels: [UInt8], _ w: Int, _ h: Int, interpolate: Bool) -> CGImage? {
+        guard let provider = CGDataProvider(data: Data(pixels) as CFData) else { return nil }
         return CGImage(width: w, height: h,
                        bitsPerComponent: 8, bitsPerPixel: 32,
                        bytesPerRow: w * 4,
@@ -177,24 +293,6 @@ final class DepthRenderer {
                        bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.premultipliedLast.rawValue),
                        provider: provider, decode: nil,
                        shouldInterpolate: interpolate, intent: .defaultIntent)
-    }
-
-    private func dot(_ out: UnsafeMutableBufferPointer<UInt8>,
-                     _ w: Int, _ h: Int, _ cx: Int, _ cy: Int,
-                     _ size: Int, _ color: (UInt8, UInt8, UInt8)) {
-        let r = size / 2
-        let y0 = max(cy - r, 0), y1 = min(cy + r, h - 1)
-        let x0 = max(cx - r, 0), x1 = min(cx + r, w - 1)
-        guard y0 <= y1, x0 <= x1 else { return }
-        for y in y0...y1 {
-            let rowBase = y * w
-            for x in x0...x1 {
-                let dx = x - cx, dy = y - cy
-                if dx * dx + dy * dy > r * r + r { continue }
-                let o = (rowBase + x) * 4
-                out[o] = color.0; out[o + 1] = color.1; out[o + 2] = color.2
-            }
-        }
     }
 
     private func medianDepth(cx: Int, cy: Int, radius: Int, w: Int, h: Int,
@@ -213,8 +311,8 @@ final class DepthRenderer {
     }
 
     private let stops: [(Float, Float, Float)] = [
-        (28, 12, 68), (36, 66, 190), (24, 176, 190),
-        (90, 214, 96), (250, 196, 62), (255, 250, 235)
+        (28, 12, 68), (36, 66, 190), (24, 176, 196),
+        (96, 218, 100), (252, 198, 64), (255, 252, 240)
     ]
 
     private func palette(_ t: Float) -> (UInt8, UInt8, UInt8) {
