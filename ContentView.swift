@@ -48,8 +48,6 @@ struct ContentView: View {
         .onDisappear { camera.stop() }
     }
 
-    // MARK: - Панель управления
-
     private var panel: some View {
         HStack(spacing: 14) {
             VStack(spacing: 10) {
@@ -57,6 +55,20 @@ struct ContentView: View {
                     ForEach(RenderStyle.allCases) { Text($0.rawValue).tag($0) }
                 }
                 .pickerStyle(.segmented)
+
+                if camera.style == .points {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Рельеф").font(.caption)
+                            Spacer()
+                            Text(String(format: "%.0f%%", camera.relief * 100))
+                                .font(.caption.monospaced())
+                                .foregroundStyle(.orange)
+                        }
+                        Slider(value: $camera.relief, in: 0...1).tint(.orange)
+                    }
+                    .foregroundStyle(.white)
+                }
 
                 Toggle("Сглаживание дыр", isOn: $camera.depthFiltering)
                     .font(.caption)
@@ -71,8 +83,6 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.bottom, 20)
     }
-
-    // MARK: - Прицел
 
     private var crosshair: some View {
         VStack(spacing: 10) {
@@ -109,8 +119,6 @@ struct ContentView: View {
             ? String(format: "%.0f см", d * 100)
             : String(format: "%.2f м", d)
     }
-
-    // MARK: - Кнопка дальномера
 
     private var rangefinderButton: some View {
         Button {
